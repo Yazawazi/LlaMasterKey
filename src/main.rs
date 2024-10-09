@@ -1,5 +1,5 @@
 use std::{collections::HashMap, str::FromStr, sync::Arc};
-
+use std::string::ToString;
 use anyhow::Context;
 use axum::{
   body::Body,
@@ -13,15 +13,54 @@ use axum::{
 };
 use config::*;
 use hyper::{header::CONTENT_TYPE, Request, StatusCode, Uri};
-
+use itertools::Itertools;
+use sha2::{Sha256, Digest};
 use state::{HyperClient, Server, ServerState};
 use tokio::net::TcpListener;
 use tower_http::{compression::CompressionLayer, limit::RequestBodyLimitLayer};
+use once_cell::sync::Lazy;
 
 mod config;
 mod state;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+static LMK_KEY: Lazy<String> = Lazy::<String>::new(|| {
+  if std::env::var("LLAMA_PASS_TOKEN").is_err() {
+    std::env::set_var("LLAMA_PASS_TOKEN", "Jokes like trying to redo it don't work.");
+  }
+  std::env::var("LLAMA_PASS_TOKEN").unwrap()
+});
+
+const WARN_MESSAGE: &str = "THIS PERMANENT KEY ONLY ALLOWS THE INSTANCE TO SEND REQUESTS TO THE KUMO LMK SERVER, ANY REQUESTS FROM OUTSIDE MAY RESULT IN MORE BILLING.";
+
+fn create_token(user_id: i64) -> String {
+  let sign_hasher = Sha256::new()
+      .chain_update("key")
+      .chain_update(user_id.to_string())
+      .chain_update(LMK_KEY.as_str())
+      .finalize();
+  let sign = base16ct::lower::encode_string(&sign_hasher);
+  format!("{user_id},{WARN_MESSAGE},{sign}")
+}
+
+fn verify_token(token: &str) -> Option<i64> {
+  let (user_id, warn_message, sign): (&str, &str, &str) = token.split(',').collect_tuple::<(_, _, _)>()?;
+  if warn_message != WARN_MESSAGE {
+    return None;
+  }
+  let user_id = user_id.parse::<i64>().ok()?;
+  let sign_hasher = Sha256::new()
+      .chain_update("key")
+      .chain_update(user_id.to_string())
+      .chain_update(LMK_KEY.as_str())
+      .finalize();
+  let expected_sign = base16ct::lower::encode_string(&sign_hasher);
+  if sign != expected_sign {
+    return None;
+  }
+  Some(user_id)
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -79,17 +118,49 @@ impl EnvFormat {
 pub async fn lmk_env(
   State(state): ServerState,
   Query(query): Query<HashMap<String, String>>,
+  request: Request<Body>,
 ) -> Response {
+  let Some(auth) = request.headers().get("authorization") else {
+    return (StatusCode::BAD_REQUEST, "No `Authorization` header").into_response();
+  };
+  let Some(requested_time) = request.headers().get("x-requested-at") else {
+    return (StatusCode::BAD_REQUEST, "No `x-requested-at` header").into_response();
+  };
+  let Some(user_id) = request.headers().get("x-user-id") else {
+    return (StatusCode::BAD_REQUEST, "No `x-user-id` header").into_response();
+  };
+  let current_time = chrono::Utc::now().timestamp();
+  let requested_time = requested_time.to_str().unwrap().parse::<i64>().unwrap();
+  if (current_time - requested_time).abs() > 60 {
+    return (StatusCode::BAD_REQUEST, "Invalid `x-requested-at` header").into_response();
+  }
+  let user_id = user_id.to_str().unwrap();
+  if user_id.parse::<i64>().is_err() {
+    return (StatusCode::BAD_REQUEST, "Invalid `x-user-id` header").into_response();
+  }
+  let hasher = Sha256::new()
+    .chain_update("generation")
+    .chain_update(user_id)
+    .chain_update(requested_time.to_string())
+    .chain_update(LMK_KEY.as_str())
+    .finalize();
+
+  if auth.to_str().unwrap() != base16ct::lower::encode_string(&hasher) {
+    return (StatusCode::BAD_REQUEST, "Invalid `Authorization` header").into_response();
+  }
+  
+  let auth_key = create_token(user_id.parse::<i64>().unwrap());
+  
   let format = query
     .get("format")
     .map(|v| EnvFormat::parse(v))
     .unwrap_or_default();
   match format {
     EnvFormat::Json => {
-      let envs: HashMap<_, _> = state.config.user_env().into_iter().collect();
+      let envs: HashMap<_, _> = state.config.user_env(Some(auth_key)).into_iter().collect();
       (StatusCode::OK, Json(envs)).into_response()
     },
-    EnvFormat::Dotenv => (StatusCode::OK, state.config.user_env_file()).into_response(),
+    EnvFormat::Dotenv => (StatusCode::OK, state.config.user_env_file(Some(auth_key))).into_response(),
   }
 }
 
@@ -115,6 +186,16 @@ pub async fn vectara(
   Path(path): Path<String>,
   mut request: Request<Body>,
 ) -> Response {
+  let Some(auth) = request.headers().get("authorization") else {
+    return (StatusCode::BAD_REQUEST, "No `Authorization` header").into_response();
+  };
+  
+  let token = auth.to_str().unwrap();
+  let Some(_user_id) = verify_token(token) else {
+    return (StatusCode::BAD_REQUEST, "Invalid `Authorization` header").into_response();
+  };
+  
+  
   let Some(token) = &state.config.vectara_token else {
     return (
       StatusCode::INTERNAL_SERVER_ERROR,
@@ -188,22 +269,14 @@ pub async fn catch_all(
   Path((llm, _path)): Path<(String, String)>,
   request: Request<Body>,
 ) -> Response {
-  // TODO: custom authenticate
+  let Some(auth) = request.headers().get("authorization") else {
+    return (StatusCode::BAD_REQUEST, "No `Authorization` header").into_response();
+  };
 
-  // let Some(auth) = request.headers().get("authorization") else {
-  //   return (StatusCode::BAD_REQUEST, "No `Authorization` header").into_response();
-  // };
-  // let Some((auth_type, auth_value)) = auth.to_str().ok().and_then(|auth| auth.split_once(' '))
-  // else {
-  //   return (StatusCode::BAD_REQUEST, "Invalid `Authorization` header").into_response();
-  // };
-  // if !auth_type.eq_ignore_ascii_case("bearer") {
-  //   return (
-  //     StatusCode::BAD_REQUEST,
-  //     "Invalid `Authorization` header, expected bearer token",
-  //   )
-  //     .into_response();
-  // }
+  let token = auth.to_str().unwrap();
+  let Some(_user_id) = verify_token(token) else {
+    return (StatusCode::BAD_REQUEST, "Invalid `Authorization` header").into_response();
+  };
 
   let (url, key) = match llm.as_str() {
     "openai" => (

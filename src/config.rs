@@ -128,18 +128,18 @@ impl Config {
   }
 
   /// Generate a bash compatible environment exports.
-  pub fn user_env_file(&self) -> String {
+  pub fn user_env_file(&self, key: Option<String>) -> String {
     let mut str = String::new();
-    for (key, value) in self.user_env() {
+    for (key, value) in self.user_env(key) {
       str.push_str(&format!("export {key}=\"{value}\"\n"))
     }
     str
   }
 
   /// Get a list of env vars for user
-  pub fn user_env(&self) -> Vec<(String, String)> {
+  pub fn user_env(&self, key: Option<String>) -> Vec<(String, String)> {
     let mut user_env = Vec::new();
-    let placeholder = String::from("LlaMaKey");
+    let placeholder = key.unwrap_or_else(|| "LMK_DEFAULT".to_string());
     if self.openai_api_key.is_some() {
       user_env.push((
         "OPENAI_BASE_URL".into(),
